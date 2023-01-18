@@ -42,9 +42,13 @@
 #include "bootutil/mcuboot_status.h"
 #include "flash_map_backend/flash_map_backend.h"
 
+#include "DA1469xAB.h"
+
+
 #ifdef CONFIG_MCUBOOT_SERIAL
 #include "boot_serial/boot_serial.h"
 #include "serial_adapter/serial_adapter.h"
+
 
 const struct boot_uart_funcs boot_funcs = {
     .read = console_read,
@@ -165,6 +169,99 @@ struct arm_vector_table {
     uint32_t reset;
 };
 
+#define MCU_MEM_QSPIF_M_START_ADDRESS   (0x16000000)
+#define SYSRAM_BASE_ADDRESS             (0x800000)
+
+#define REG_SETF(base, reg, field, new_val) \
+                base->reg = ((base->reg & ~(base##_##reg##_##field##_Msk)) | \
+                ((base##_##reg##_##field##_Msk) & ((new_val) << (base##_##reg##_##field##_Pos))))
+
+#define REG_GETF(base, reg, field) \
+        (((base->reg) & (base##_##reg##_##field##_Msk)) >> (base##_##reg##_##field##_Pos))
+
+
+void configure_cache(void *img_start)
+{
+        uint32_t flash_region_size;
+        uint32_t cache_len;
+        uint32_t ivt_address;
+        /* make sure the cache is disabled before configuring it */
+        CACHE->CACHE_CTRL2_REG= 0;
+        REG_SETF(CRG_TOP,SYS_CTRL_REG, CACHERAM_MUX, 0);  /* DISABLES CACHE CONTROLLER */
+
+        /* disable MRM unit */
+        CACHE->CACHE_MRM_CTRL_REG= 0;
+        CACHE->CACHE_MRM_TINT_REG= 0;
+        CACHE->CACHE_MRM_MISSES_THRES_REG= 0;
+
+        //configure CACHE_FLASH_REG to point to IVT
+        ivt_address = MCU_MEM_QSPIF_M_START_ADDRESS + (uint32_t)img_start - 0x200;
+
+        REG_SETF(CACHE, CACHE_FLASH_REG, FLASH_REGION_BASE, (ivt_address >> 16) );
+        REG_SETF(CACHE, CACHE_FLASH_REG, FLASH_REGION_OFFSET, ((ivt_address&0xFFFF) >>2) ); //lower 16 bits in number of 32bit words
+
+        /*
+         * CACHE_CTRL2_REG
+         *   CACHE_LEN=FLASH_REGION_SIZE / 64KB
+         *   CACHE_WEN=0        (RO, updated only by the cache controller)
+         *   CACHE_CGEN=0       (clock-gating disabled, i.e. cache controller is active)
+         */
+        //set cache_len to max of flash_region_size / 64KB
+        flash_region_size = REG_GETF(CACHE, CACHE_FLASH_REG, FLASH_REGION_SIZE);
+        switch(flash_region_size)
+        {
+                case 0: //32 MB
+                        cache_len = 0x1FF;
+                        break;
+                case 1: //16 MB
+                        cache_len = 0x100;
+                        break;
+                case 2: //8 MB
+                        cache_len = 0x80;
+                        break;
+                case 3: //4MB
+                        cache_len = 0x40;
+                        break;
+                case 4: //2MB
+                        cache_len = 0x20;
+                        break;
+                case 5: //1MB
+                        cache_len = 0x10;
+                        break;
+                case 6: //0.5MB
+                        cache_len = 0x08;
+                        break;
+                case 7: //0.25MB
+                        cache_len = 0x04;
+                        break;
+                default: //0.5MB
+                        cache_len = 0x08;
+                        break;
+
+        }
+
+        REG_SETF(CACHE,CACHE_CTRL2_REG, CACHE_LEN, cache_len);
+}
+
+void copy_ivt(void *img_start)
+{
+        uint32_t ivt_start_addr = MCU_MEM_QSPIF_M_START_ADDRESS + (uint32_t)img_start;
+        memcpy((void*)SYSRAM_BASE_ADDRESS, (void*)ivt_start_addr, 0x200);
+}
+
+void hal_system_start(void *img_start)
+{
+    configure_cache(img_start);
+    copy_ivt(img_start);
+
+    CRG_TOP->SYS_CTRL_REG = (CRG_TOP->SYS_CTRL_REG & ~CRG_TOP_SYS_CTRL_REG_REMAP_ADR0_Msk) |
+                                CRG_TOP_SYS_CTRL_REG_CACHERAM_MUX_Msk |
+                                CRG_TOP_SYS_CTRL_REG_REMAP_INTVECT_Msk |
+                                CRG_TOP_SYS_CTRL_REG_SW_RESET_Msk |
+                                0x2;
+
+}
+
 static void do_boot(struct boot_rsp *rsp)
 {
     struct arm_vector_table *vt;
@@ -184,6 +281,8 @@ static void do_boot(struct boot_rsp *rsp)
     /* Jump to flash image */
     rc = flash_device_base(rsp->br_flash_dev_id, &flash_base);
     assert(rc == 0);
+
+    hal_system_start((void *)(rsp->br_image_off + rsp->br_hdr->ih_hdr_size));
 
     vt = (struct arm_vector_table *)(flash_base +
                                      rsp->br_image_off +
@@ -520,7 +619,6 @@ void main(void)
     os_heap_init();
 
     ZEPHYR_BOOT_LOG_START();
-
     (void)rc;
 
     mcuboot_status_change(MCUBOOT_STATUS_STARTUP);
